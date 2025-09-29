@@ -3,26 +3,64 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
+// FIX: Import Modality for specifying response types.
+import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
 
-// Helper function to convert a File object to a Gemini API Part
-const fileToPart = async (file: File): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
+// Resizes an image to fit within a max dimension (512 or 1024) while maintaining aspect ratio,
+// then converts it to a Gemini API Part. This is used to control image resolution for the API.
+const resizeAndFileToPart = async (file: File, hdMode: boolean): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
+    const maxDimension = hdMode ? 1024 : 512;
+    
+    return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = error => reject(error);
+        reader.onload = (readerEvent) => {
+            if (!readerEvent.target || !readerEvent.target.result) {
+                return reject(new Error("Failed to read file."));
+            }
+            const image = new Image();
+            image.src = readerEvent.target.result as string;
+            image.onload = () => {
+                const canvas = document.createElement('canvas');
+                let { width, height } = image;
+
+                if (width > height) {
+                    if (width > maxDimension) {
+                        height = Math.round(height * (maxDimension / width));
+                        width = maxDimension;
+                    }
+                } else {
+                    if (height > maxDimension) {
+                        width = Math.round(width * (maxDimension / height));
+                        height = maxDimension;
+                    }
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) {
+                    return reject(new Error('Could not get canvas context'));
+                }
+                ctx.drawImage(image, 0, 0, width, height);
+
+                const dataUrl = canvas.toDataURL(file.type);
+                
+                const arr = dataUrl.split(',');
+                if (arr.length < 2) return reject(new Error("Invalid data URL"));
+                const mimeMatch = arr[0].match(/:(.*?);/);
+                if (!mimeMatch || !mimeMatch[1]) return reject(new Error("Could not parse MIME type from data URL"));
+                
+                const mimeType = mimeMatch[1];
+                const data = arr[1];
+                resolve({ inlineData: { mimeType, data } });
+            };
+            image.onerror = (e) => reject(new Error(`Image loading failed: ${e}`));
+        };
+        reader.onerror = (e) => reject(new Error(`File reading failed: ${e}`));
     });
-    
-    const arr = dataUrl.split(',');
-    if (arr.length < 2) throw new Error("Invalid data URL");
-    const mimeMatch = arr[0].match(/:(.*?);/);
-    if (!mimeMatch || !mimeMatch[1]) throw new Error("Could not parse MIME type from data URL");
-    
-    const mimeType = mimeMatch[1];
-    const data = arr[1];
-    return { inlineData: { mimeType, data } };
 };
+
 
 const handleApiResponse = (
     response: GenerateContentResponse,
@@ -68,17 +106,20 @@ const handleApiResponse = (
  * @param originalImage The original image file.
  * @param userPrompt The text prompt describing the desired edit.
  * @param hotspot The {x, y} coordinates on the image to focus the edit.
+ * @param hdMode Whether to process the image in high-definition (1024x1024). Defaults to false (512x512).
  * @returns A promise that resolves to the data URL of the edited image.
  */
 export const generateEditedImage = async (
     originalImage: File,
     userPrompt: string,
-    hotspot: { x: number, y: number }
+    hotspot: { x: number, y: number },
+    hdMode: boolean = false
 ): Promise<string> => {
     console.log('Starting generative edit at:', hotspot);
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
     
-    const originalImagePart = await fileToPart(originalImage);
+    const imagePart = await resizeAndFileToPart(originalImage, hdMode);
+
     const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request.
 User Request: "${userPrompt}"
 Edit Location: Focus on the area around pixel coordinates (x: ${hotspot.x}, y: ${hotspot.y}).
@@ -94,10 +135,14 @@ Safety & Ethics Policy:
 Output: Return ONLY the final edited image. Do not return text.`;
     const textPart = { text: prompt };
 
-    console.log('Sending image and prompt to the model...');
+    console.log('Sending resized image and prompt to the model...');
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
+        contents: { parts: [imagePart, textPart] },
+        // FIX: Added required config for the image editing model.
+        config: {
+            responseModalities: [Modality.IMAGE, Modality.TEXT],
+        },
     });
     console.log('Received response from model.', response);
 
@@ -108,16 +153,19 @@ Output: Return ONLY the final edited image. Do not return text.`;
  * Generates an image with a filter applied using generative AI.
  * @param originalImage The original image file.
  * @param filterPrompt The text prompt describing the desired filter.
+ * @param hdMode Whether to process the image in high-definition (1024x1024). Defaults to false (512x512).
  * @returns A promise that resolves to the data URL of the filtered image.
  */
 export const generateFilteredImage = async (
     originalImage: File,
     filterPrompt: string,
+    hdMode: boolean = false
 ): Promise<string> => {
     console.log(`Starting filter generation: ${filterPrompt}`);
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
     
-    const originalImagePart = await fileToPart(originalImage);
+    const imagePart = await resizeAndFileToPart(originalImage, hdMode);
+    
     const prompt = `You are an expert photo editor AI. Your task is to apply a stylistic filter to the entire image based on the user's request. Do not change the composition or content, only apply the style.
 Filter Request: "${filterPrompt}"
 
@@ -128,10 +176,14 @@ Safety & Ethics Policy:
 Output: Return ONLY the final filtered image. Do not return text.`;
     const textPart = { text: prompt };
 
-    console.log('Sending image and filter prompt to the model...');
+    console.log('Sending resized image and filter prompt to the model...');
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
+        contents: { parts: [imagePart, textPart] },
+        // FIX: Added required config for the image editing model.
+        config: {
+            responseModalities: [Modality.IMAGE, Modality.TEXT],
+        },
     });
     console.log('Received response from model for filter.', response);
     
@@ -142,16 +194,19 @@ Output: Return ONLY the final filtered image. Do not return text.`;
  * Generates an image with a global adjustment applied using generative AI.
  * @param originalImage The original image file.
  * @param adjustmentPrompt The text prompt describing the desired adjustment.
+ * @param hdMode Whether to process the image in high-definition (1024x1024). Defaults to false (512x512).
  * @returns A promise that resolves to the data URL of the adjusted image.
  */
 export const generateAdjustedImage = async (
     originalImage: File,
     adjustmentPrompt: string,
+    hdMode: boolean = false
 ): Promise<string> => {
     console.log(`Starting global adjustment generation: ${adjustmentPrompt}`);
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
     
-    const originalImagePart = await fileToPart(originalImage);
+    const imagePart = await resizeAndFileToPart(originalImage, hdMode);
+
     const prompt = `You are an expert photo editor AI. Your task is to perform a natural, global adjustment to the entire image based on the user's request.
 User Request: "${adjustmentPrompt}"
 
@@ -166,10 +221,14 @@ Safety & Ethics Policy:
 Output: Return ONLY the final adjusted image. Do not return text.`;
     const textPart = { text: prompt };
 
-    console.log('Sending image and adjustment prompt to the model...');
+    console.log('Sending resized image and adjustment prompt to the model...');
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
+        contents: { parts: [imagePart, textPart] },
+        // FIX: Added required config for the image editing model.
+        config: {
+            responseModalities: [Modality.IMAGE, Modality.TEXT],
+        },
     });
     console.log('Received response from model for adjustment.', response);
     
